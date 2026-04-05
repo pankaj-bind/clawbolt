@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 
 from backend.app.agent.dto import (
     HeartbeatLogEntry,
@@ -342,10 +342,36 @@ class IdempotencyStore:
             db.add(key)
             try:
                 db.commit()
-                return True
             except IntegrityError:
                 db.rollback()
                 return False
+
+        try:
+            self._prune()
+        except Exception:
+            logger.warning("IdempotencyStore prune failed", exc_info=True)
+        return True
+
+    def _prune(self) -> None:
+        """Remove the oldest rows when the table exceeds ``_SEEN_MAX``.
+
+        Keeps the newest rows by ``id`` (autoincrement, so allocation
+        order is monotonic even if commit order isn't -- fine for dedup).
+        Uses a single DELETE with a NOT-IN subquery so the whole thing
+        runs in one snapshot under READ COMMITTED; concurrent prunes
+        just delete the same set of rows instead of cascading.
+        We order by ``id`` rather than ``created_at`` because
+        app-generated timestamps can drift across workers.
+        """
+        with db_session() as db:
+            count = db.query(func.count(IdempotencyKey.id)).scalar() or 0
+            if count <= _SEEN_MAX:
+                return
+            keep = select(IdempotencyKey.id).order_by(IdempotencyKey.id.desc()).limit(_SEEN_MAX)
+            db.query(IdempotencyKey).filter(IdempotencyKey.id.notin_(keep)).delete(
+                synchronize_session=False
+            )
+            db.commit()
 
     async def mark_seen(self, external_id: str) -> None:
         """Insert an IdempotencyKey row (ignore if it already exists).
